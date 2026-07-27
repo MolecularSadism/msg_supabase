@@ -224,9 +224,7 @@ fn on_sync_to_supabase<T: SupabaseRow>(
                 }
             };
 
-            if let Ok(mut queue) = sender.lock() {
-                queue.push_back(outcome);
-            }
+            sender.send(outcome);
         },
     );
 
@@ -243,11 +241,7 @@ fn poll_sync_results<T: SupabaseRow>(
     mut state: ResMut<SyncState<T>>,
     mut commands: Commands,
 ) {
-    let Ok(mut locked) = queue.0.try_lock() else {
-        return;
-    };
-
-    while let Some(outcome) = locked.pop_front() {
+    for outcome in queue.drain() {
         match outcome {
             SyncOutcome::Success {
                 primary_key,

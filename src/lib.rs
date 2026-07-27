@@ -11,8 +11,15 @@
 //!   - `Update`: First save inserts, subsequent saves update the same row
 //! - **Session-aware Sync State**: Tracks what has been synced to avoid duplicates
 //! - **Primary Key Management**: Automatically retrieves and stores database IDs
-//! - **Event-driven API**: Trigger syncs with `SyncToSupabase<T>` events;
-//!     listen for `SyncComplete<T>` or `SyncError<T>` to react to outcomes
+//! - **Event-driven API**: Trigger syncs with `SyncToSupabase<T>` events; listen for
+//!   `SyncComplete<T>` or `SyncError<T>` to react to outcomes
+//! - **Request Building**: [`WriteOptions`] and [`TableQuery`] cover upserts on explicit conflict
+//!   columns, column projections, filters, ordering and limits — and [`build_write_request`] hands
+//!   back the request for callers that send it themselves
+//! - **Reads**: [`execute_select`] pulls rows from tables and views, such as leaderboards
+//! - **Async Bridge**: [`ResultQueue`] carries results from HTTP callbacks into Bevy systems
+//! - **Incremental Sync**: [`SyncCursor`], [`SyncCursors`] and [`SyncWatermarks`] track what the
+//!   server already has, so a repeated push carries only what changed
 //!
 //! # Example
 //!
@@ -53,29 +60,43 @@
 //! ```
 
 mod config;
+pub mod cursor;
 pub mod error;
 mod event;
 mod plugin;
-pub(crate) mod queue;
+pub mod query;
+pub mod queue;
 pub mod request;
 mod state;
 mod traits;
 
 pub use config::{SaveMode, SyncConfig};
+pub use cursor::{SyncCursor, SyncCursors, SyncWatermarks};
 pub use error::RequestError;
 pub use event::{SyncComplete, SyncError, SyncToSupabase};
-pub use plugin::SupabasePlugin;
-pub use request::{SupabaseConnection, execute_insert};
+pub use plugin::{SupabaseConfig, SupabasePlugin};
+pub use query::{Order, TableQuery};
+pub use queue::{QueueSender, ResultQueue};
+pub use request::{
+    SupabaseConnection, WriteOptions, build_select_request, build_write_request, execute_insert,
+    execute_select, execute_write, execute_write_returning,
+};
 pub use state::SyncState;
 pub use traits::SupabaseRow;
 
 /// Convenient imports for using `msg_supabase`.
 pub mod prelude {
     pub use crate::config::{SaveMode, SyncConfig};
+    pub use crate::cursor::{SyncCursor, SyncCursors, SyncWatermarks};
     pub use crate::error::RequestError;
     pub use crate::event::{SyncComplete, SyncError, SyncToSupabase};
-    pub use crate::plugin::SupabasePlugin;
-    pub use crate::request::{SupabaseConnection, execute_insert};
+    pub use crate::plugin::{SupabaseConfig, SupabasePlugin};
+    pub use crate::query::{Order, TableQuery};
+    pub use crate::queue::{QueueSender, ResultQueue};
+    pub use crate::request::{
+        SupabaseConnection, WriteOptions, build_select_request, build_write_request,
+        execute_insert, execute_select, execute_write, execute_write_returning,
+    };
     pub use crate::state::SyncState;
     pub use crate::traits::SupabaseRow;
 }
