@@ -1,13 +1,12 @@
 //! Channel bridge between ehttp async callbacks and the Bevy World.
 
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 
 use crate::error::RequestError;
-use crate::traits::SupabaseRow;
+use crate::traits::{SupabaseRow, SupabaseView};
 
 /// A queue that HTTP callbacks push into and a Bevy system drains.
 ///
@@ -121,14 +120,17 @@ impl<T: Send + 'static> QueueSender<T> {
 
 /// Outcome of a single sync operation, queued by the ehttp callback and
 /// drained each frame by `poll_sync_results`.
-pub(crate) enum SyncOutcome {
+pub(crate) enum SyncOutcome<T: SupabaseRow> {
     Success {
-        primary_key: Option<i64>,
+        /// Rows the server returned, empty when no response body was asked for.
+        rows: Vec<T::Response>,
+        /// Primary keys the server assigned, in the order they came back.
+        primary_keys: Vec<i64>,
         was_insert: bool,
         /// HTTP status from the response.
         status: u16,
-        /// Sync key to mark as done in `SyncState`, if deduplication was used.
-        sync_key: Option<String>,
+        /// Sync keys of the rows that were written, marked done in `SyncState`.
+        sync_keys: Vec<String>,
     },
     Failure(RequestError),
 }
@@ -137,27 +139,57 @@ pub(crate) enum SyncOutcome {
 /// registered `SupabaseRow` drains independently.
 #[derive(Resource)]
 pub(crate) struct SyncResultQueue<T: SupabaseRow> {
-    queue: ResultQueue<SyncOutcome>,
-    _marker: PhantomData<fn() -> T>,
+    queue: ResultQueue<SyncOutcome<T>>,
 }
 
 impl<T: SupabaseRow> Default for SyncResultQueue<T> {
     fn default() -> Self {
         Self {
             queue: ResultQueue::new(),
-            _marker: PhantomData,
         }
     }
 }
 
 impl<T: SupabaseRow> SyncResultQueue<T> {
     /// Get a sender for use in an ehttp callback.
-    pub(crate) fn sender(&self) -> QueueSender<SyncOutcome> {
+    pub(crate) fn sender(&self) -> QueueSender<SyncOutcome<T>> {
         self.queue.sender()
     }
 
     /// Take every outcome queued so far.
-    pub(crate) fn drain(&self) -> Vec<SyncOutcome> {
+    pub(crate) fn drain(&self) -> Vec<SyncOutcome<T>> {
+        self.queue.drain()
+    }
+}
+
+/// Outcome of a single view read.
+pub(crate) enum ViewOutcome<R: SupabaseView> {
+    Rows(Vec<R>),
+    Failure(RequestError),
+}
+
+/// Per-view queue of [`ViewOutcome`]s.
+#[derive(Resource)]
+pub(crate) struct ViewResultQueue<R: SupabaseView> {
+    queue: ResultQueue<ViewOutcome<R>>,
+}
+
+impl<R: SupabaseView> Default for ViewResultQueue<R> {
+    fn default() -> Self {
+        Self {
+            queue: ResultQueue::new(),
+        }
+    }
+}
+
+impl<R: SupabaseView> ViewResultQueue<R> {
+    /// Get a sender for use in an ehttp callback.
+    pub(crate) fn sender(&self) -> QueueSender<ViewOutcome<R>> {
+        self.queue.sender()
+    }
+
+    /// Take every outcome queued so far.
+    pub(crate) fn drain(&self) -> Vec<ViewOutcome<R>> {
         self.queue.drain()
     }
 }

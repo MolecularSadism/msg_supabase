@@ -1,18 +1,17 @@
 //! HTTP request construction and dispatch for Supabase's PostgREST API.
 //!
-//! Three layers, from lowest to highest:
+//! Two layers:
 //!
 //! - [`build_write_request`] and [`build_select_request`] hand back an `ehttp::Request` for
 //!   callers that want to send it themselves — with a custom timeout, or blocking.
-//! - [`execute_write`], [`execute_write_returning`] and [`execute_select`] send a request and
-//!   report the outcome through a callback.
-//! - [`execute_sync`] applies a [`SyncConfig`] and is what
-//!   [`SupabasePlugin`](crate::plugin::SupabasePlugin) drives.
+//! - [`execute_write_returning`], [`execute_update`] and [`execute_select`] send a request and
+//!   report the outcome through a callback. These are what
+//!   [`SupabasePlugin`](crate::plugin::SupabasePlugin) and
+//!   [`SupabaseViewPlugin`](crate::view::SupabaseViewPlugin) drive.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::config::{SaveMode, SyncConfig};
 use crate::error::RequestError;
 use crate::query::TableQuery;
 use crate::traits::SupabaseRow;
@@ -56,6 +55,20 @@ impl SupabaseConnection {
 #[derive(serde::Deserialize, Debug)]
 pub struct PrimaryKeyResponse {
     pub id: i64,
+}
+
+/// What a write returned: the rows the server sent back, the primary keys
+/// among them, and the HTTP status.
+#[derive(Debug)]
+pub struct WriteResponse<R> {
+    /// Rows the server returned, empty when no response body was asked for.
+    pub rows: Vec<R>,
+
+    /// Primary keys the server assigned, in the order they came back.
+    pub primary_keys: Vec<i64>,
+
+    /// HTTP status code from the response.
+    pub status: u16,
 }
 
 /// How a write resolves conflicts, and what it returns.
@@ -146,19 +159,12 @@ impl WriteOptions {
     }
 
     /// The URL query parameters for these options.
-    fn query(&self) -> TableQuery {
+    pub(crate) fn query(&self) -> TableQuery {
         let mut query = TableQuery::new().on_conflict(self.on_conflict.iter().cloned());
         if let Some(ref columns) = self.returning {
             query = query.select(columns.clone());
         }
         query
-    }
-
-    /// The same options, asking for the written rows back.
-    fn requesting_rows(&self) -> Self {
-        let mut options = self.clone();
-        options.return_rows = true;
-        options
     }
 }
 
@@ -268,34 +274,10 @@ pub fn build_select_request(
     }
 }
 
-/// Write `rows` to `table`, reporting only success or failure.
+/// Write `rows` to `table` and deserialize what the server sends back.
 ///
-/// Completes immediately with `Ok` when `rows` is empty.
-pub fn execute_write<T, F>(
-    connection: &SupabaseConnection,
-    rows: &[T],
-    table: &str,
-    options: &WriteOptions,
-    on_complete: F,
-) where
-    T: Serialize,
-    F: FnOnce(Result<(), RequestError>) + Send + 'static,
-{
-    if rows.is_empty() {
-        on_complete(Ok(()));
-        return;
-    }
-
-    match build_write_request(connection, rows, table, options) {
-        Ok(request) => send(request, move |result| on_complete(result.map(|_| ()))),
-        Err(err) => on_complete(Err(err)),
-    }
-}
-
-/// Write `rows` to `table` and deserialize the rows the server sends back.
-///
-/// Asks for a response body even when `options` did not. Completes immediately
-/// with an empty `Vec` when `rows` is empty.
+/// A write that asked for no response body reports no rows, which is not an
+/// error. Completes immediately with an empty response when `rows` is empty.
 pub fn execute_write_returning<T, R, F>(
     connection: &SupabaseConnection,
     rows: &[T],
@@ -305,16 +287,26 @@ pub fn execute_write_returning<T, R, F>(
 ) where
     T: Serialize,
     R: DeserializeOwned,
-    F: FnOnce(Result<Vec<R>, RequestError>) + Send + 'static,
+    F: FnOnce(Result<WriteResponse<R>, RequestError>) + Send + 'static,
 {
     if rows.is_empty() {
-        on_complete(Ok(Vec::new()));
+        on_complete(Ok(WriteResponse {
+            rows: Vec::new(),
+            primary_keys: Vec::new(),
+            status: 0,
+        }));
         return;
     }
 
-    match build_write_request(connection, rows, table, &options.requesting_rows()) {
+    match build_write_request(connection, rows, table, options) {
         Ok(request) => send(request, move |result| {
-            on_complete(result.and_then(|response| decode_rows(&response)));
+            on_complete(result.and_then(|response| {
+                Ok(WriteResponse {
+                    rows: decode_rows(&response)?,
+                    primary_keys: primary_keys(&response),
+                    status: response.status,
+                })
+            }));
         }),
         Err(err) => on_complete(Err(err)),
     }
@@ -368,33 +360,6 @@ pub fn execute_select<R, F>(
     );
 }
 
-/// Execute an insert request to Supabase.
-pub fn execute_insert<T, F>(connection: &SupabaseConnection, data: &T, table: &str, on_complete: F)
-where
-    T: SupabaseRow,
-    F: FnOnce(Result<Option<i64>, RequestError>) + Send + 'static,
-{
-    write_one(
-        connection,
-        data,
-        table,
-        &WriteOptions::new().returning_all(),
-        on_complete,
-    );
-}
-
-/// Execute an upsert request to Supabase.
-///
-/// Conflicts resolve on [`SupabaseRow::unique_columns`]; with no unique columns
-/// the server falls back to the table's primary key.
-pub fn execute_upsert<T, F>(connection: &SupabaseConnection, data: &T, table: &str, on_complete: F)
-where
-    T: SupabaseRow,
-    F: FnOnce(Result<Option<i64>, RequestError>) + Send + 'static,
-{
-    write_one(connection, data, table, &upsert_options::<T>(), on_complete);
-}
-
 /// Execute an update request to Supabase using the primary key.
 pub fn execute_update<T, F>(
     connection: &SupabaseConnection,
@@ -427,137 +392,6 @@ pub fn execute_update<T, F>(
     send(request, move |result| {
         on_complete(result.map(|_| None));
     });
-}
-
-/// Execute a request based on the sync configuration and current state.
-pub fn execute_sync<T, F>(
-    connection: &SupabaseConnection,
-    data: &T,
-    config: &SyncConfig,
-    has_primary_key: bool,
-    primary_key: Option<i64>,
-    on_complete: F,
-) where
-    T: SupabaseRow,
-    F: FnOnce(Result<Option<i64>, RequestError>, bool) + Send + 'static,
-{
-    let table: String = config
-        .table_override
-        .clone()
-        .unwrap_or_else(|| T::table_name().to_string());
-
-    match config.save_mode {
-        SaveMode::Insert => {
-            execute_insert(connection, data, &table, move |result| {
-                on_complete(result, true);
-            });
-        }
-        SaveMode::Upsert => {
-            execute_upsert(connection, data, &table, move |result| {
-                on_complete(result, true);
-            });
-        }
-        SaveMode::Update => match (has_primary_key, primary_key) {
-            (true, Some(pk)) => execute_update(
-                connection,
-                data,
-                &table,
-                pk,
-                T::primary_key_column(),
-                move |result| {
-                    on_complete(result, false);
-                },
-            ),
-            _ => execute_upsert(connection, data, &table, move |result| {
-                on_complete(result, true);
-            }),
-        },
-    }
-}
-
-/// Execute a batch insert request to Supabase.
-pub fn execute_batch_insert<T, F>(
-    connection: &SupabaseConnection,
-    data: &[T],
-    table: &str,
-    on_complete: F,
-) where
-    T: SupabaseRow,
-    F: FnOnce(Result<Vec<i64>, RequestError>) + Send + 'static,
-{
-    write_many(
-        connection,
-        data,
-        table,
-        &WriteOptions::new().returning_all(),
-        on_complete,
-    );
-}
-
-/// Execute a batch upsert request to Supabase.
-///
-/// Conflicts resolve on [`SupabaseRow::unique_columns`]; with no unique columns
-/// the server falls back to the table's primary key.
-pub fn execute_batch_upsert<T, F>(
-    connection: &SupabaseConnection,
-    data: &[T],
-    table: &str,
-    on_complete: F,
-) where
-    T: SupabaseRow,
-    F: FnOnce(Result<Vec<i64>, RequestError>) + Send + 'static,
-{
-    write_many(connection, data, table, &upsert_options::<T>(), on_complete);
-}
-
-/// Upsert options resolving on a row type's unique columns.
-fn upsert_options<T: SupabaseRow>() -> WriteOptions {
-    WriteOptions::new()
-        .on_conflict(T::unique_columns().iter().copied())
-        .returning_all()
-}
-
-/// Write a single row, reporting the primary key the server assigned.
-fn write_one<T, F>(
-    connection: &SupabaseConnection,
-    data: &T,
-    table: &str,
-    options: &WriteOptions,
-    on_complete: F,
-) where
-    T: SupabaseRow,
-    F: FnOnce(Result<Option<i64>, RequestError>) + Send + 'static,
-{
-    match build_write_request(connection, std::slice::from_ref(data), table, options) {
-        Ok(request) => send(request, move |result| {
-            on_complete(result.map(|response| first_primary_key(&response)));
-        }),
-        Err(err) => on_complete(Err(err)),
-    }
-}
-
-/// Write several rows, reporting the primary keys the server assigned.
-fn write_many<T, F>(
-    connection: &SupabaseConnection,
-    data: &[T],
-    table: &str,
-    options: &WriteOptions,
-    on_complete: F,
-) where
-    T: SupabaseRow,
-    F: FnOnce(Result<Vec<i64>, RequestError>) + Send + 'static,
-{
-    if data.is_empty() {
-        on_complete(Ok(Vec::new()));
-        return;
-    }
-
-    match build_write_request(connection, data, table, options) {
-        Ok(request) => send(request, move |result| {
-            on_complete(result.map(|response| primary_keys(&response)));
-        }),
-        Err(err) => on_complete(Err(err)),
-    }
 }
 
 /// Send `request`, handing the callback either a successful response or a
@@ -598,6 +432,10 @@ fn decode_rows<R: DeserializeOwned>(response: &ehttp::Response) -> Result<Vec<R>
         ));
     };
 
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
     serde_json::from_str::<Vec<R>>(body).map_err(|e| {
         RequestError::http(
             format!("Failed to parse response: {e}"),
@@ -607,13 +445,8 @@ fn decode_rows<R: DeserializeOwned>(response: &ehttp::Response) -> Result<Vec<R>
     })
 }
 
-/// Primary key of the first returned row, if the body carries one.
-fn first_primary_key(response: &ehttp::Response) -> Option<i64> {
-    primary_keys(response).first().copied()
-}
-
 /// Primary keys of the returned rows, empty if the body carries none.
-fn primary_keys(response: &ehttp::Response) -> Vec<i64> {
+pub(crate) fn primary_keys(response: &ehttp::Response) -> Vec<i64> {
     response
         .text()
         .and_then(|body| serde_json::from_str::<Vec<PrimaryKeyResponse>>(body).ok())
@@ -633,6 +466,8 @@ mod tests {
     }
 
     impl SupabaseRow for TestRow {
+        type Response = PrimaryKeyResponse;
+
         fn table_name() -> &'static str {
             "runs"
         }
@@ -704,27 +539,30 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_write_reports_no_rows() {
+        let rows: [TestRow; 0] = [];
+        let outcome = Arc::new(Mutex::new(None));
+        let sink = outcome.clone();
+
+        execute_write_returning(
+            &connection(),
+            &rows,
+            "runs",
+            &WriteOptions::new(),
+            move |result: Result<WriteResponse<PrimaryKeyResponse>, RequestError>| {
+                *sink.lock().unwrap() = result.ok().map(|response| response.rows.len());
+            },
+        );
+
+        assert_eq!(*outcome.lock().unwrap(), Some(0));
+    }
+
+    #[test]
     fn returning_all_omits_the_select() {
         let options = WriteOptions::new().returning_all();
         assert!(options.returns_rows());
         assert_eq!(options.prefer_header(), "return=representation");
         assert_eq!(options.query().to_query_string(), "");
-    }
-
-    #[test]
-    fn requesting_rows_upgrades_a_minimal_write() {
-        let options = WriteOptions::new().on_conflict(["id"]).requesting_rows();
-        assert!(options.returns_rows());
-        assert!(options.is_upsert());
-    }
-
-    #[test]
-    fn upsert_options_follow_the_row_type() {
-        let options = upsert_options::<TestRow>();
-        assert_eq!(
-            options.query().to_query_string(),
-            "on_conflict=session_pk,run_index"
-        );
     }
 
     #[test]
@@ -771,37 +609,5 @@ mod tests {
             "https://test.supabase.co/rest/v1/highscores_runs?select=*&limit=1000"
         );
         assert_eq!(header(&request, "apikey").as_deref(), Some("key123"));
-    }
-
-    #[test]
-    fn empty_write_completes_without_a_request() {
-        let rows: [TestRow; 0] = [];
-        let outcome = Arc::new(Mutex::new(None));
-        let sink = outcome.clone();
-
-        execute_write(
-            &connection(),
-            &rows,
-            "runs",
-            &WriteOptions::new(),
-            move |result| {
-                *sink.lock().unwrap() = Some(result.is_ok());
-            },
-        );
-
-        assert_eq!(*outcome.lock().unwrap(), Some(true));
-    }
-
-    #[test]
-    fn empty_batch_insert_returns_no_ids() {
-        let rows: [TestRow; 0] = [];
-        let outcome = Arc::new(Mutex::new(None));
-        let sink = outcome.clone();
-
-        execute_batch_insert(&connection(), &rows, "runs", move |result| {
-            *sink.lock().unwrap() = result.ok();
-        });
-
-        assert_eq!(*outcome.lock().unwrap(), Some(Vec::new()));
     }
 }

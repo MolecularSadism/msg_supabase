@@ -1,6 +1,9 @@
 //! Trait definitions for Supabase-syncable types.
 
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::query::TableQuery;
 
 /// Trait for types that can be synced to a Supabase table.
 ///
@@ -10,7 +13,7 @@ use serde::Serialize;
 ///
 /// ```rust
 /// use msg_supabase::prelude::*;
-/// use serde::Serialize;
+/// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Clone, Serialize)]
 /// struct GameSession {
@@ -19,7 +22,16 @@ use serde::Serialize;
 ///     score: u32,
 /// }
 ///
+/// /// The columns the server sends back after writing a session.
+/// #[derive(Deserialize)]
+/// struct GameSessionResponse {
+///     id: i64,
+///     session_id: i64,
+/// }
+///
 /// impl SupabaseRow for GameSession {
+///     type Response = GameSessionResponse;
+///
 ///     fn table_name() -> &'static str {
 ///         "game_sessions"
 ///     }
@@ -31,9 +43,21 @@ use serde::Serialize;
 ///     fn unique_columns() -> &'static [&'static str] {
 ///         &["session_id"]  // Used for upsert conflict resolution
 ///     }
+///
+///     fn returning() -> Option<&'static str> {
+///         Some("id,session_id")  // Matches `GameSessionResponse`
+///     }
 /// }
 /// ```
 pub trait SupabaseRow: Clone + Serialize + Send + Sync + 'static {
+    /// Shape of the rows the server sends back after a write.
+    ///
+    /// Set this to [`PrimaryKeyResponse`](crate::request::PrimaryKeyResponse)
+    /// when only the database id matters, and to your own type when
+    /// [`returning`](Self::returning) projects more columns. It is unused when
+    /// `returning` is `None`.
+    type Response: DeserializeOwned + Send + Sync + 'static;
+
     /// The name of the Supabase table this type maps to.
     fn table_name() -> &'static str;
 
@@ -44,15 +68,63 @@ pub trait SupabaseRow: Clone + Serialize + Send + Sync + 'static {
 
     /// Column names that uniquely identify a row for upsert operations.
     ///
-    /// When using `SaveMode::Update`, these columns are used in the
-    /// `ON CONFLICT` clause for upsert operations.
+    /// Under [`SaveMode::Upsert`](crate::config::SaveMode::Upsert) these become
+    /// the `ON CONFLICT` target. With no unique columns the server falls back
+    /// to the table's primary key.
     fn unique_columns() -> &'static [&'static str];
+
+    /// Columns the server should return after a write, deserialized into
+    /// [`Response`](Self::Response).
+    ///
+    /// `None` asks for no response body, which is what a write whose ids
+    /// nobody reads should do.
+    fn returning() -> Option<&'static str> {
+        None
+    }
 
     /// Optional: Generate a unique sync key for deduplication.
     ///
-    /// Override this if you want custom deduplication logic.
-    /// By default, returns `None` (no deduplication by key).
+    /// Rows carrying a key that was already written are dropped before an
+    /// insert, so re-sending the whole list on every save writes only what is
+    /// new. Returns `None` by default (no deduplication by key).
     fn sync_key(&self) -> Option<String> {
         None
+    }
+}
+
+/// Trait for types read back from a Supabase table or view.
+///
+/// Views are the read side of the same database: leaderboards, aggregates, or
+/// any table the game only consumes.
+///
+/// # Example
+///
+/// ```rust
+/// use msg_supabase::prelude::*;
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Highscore {
+///     player_id: String,
+///     kills: i64,
+/// }
+///
+/// impl SupabaseView for Highscore {
+///     fn view_name() -> &'static str {
+///         "highscores"
+///     }
+///
+///     fn query() -> TableQuery {
+///         TableQuery::new().select("*").limit(1000)
+///     }
+/// }
+/// ```
+pub trait SupabaseView: DeserializeOwned + Send + Sync + 'static {
+    /// The name of the Supabase table or view this type reads from.
+    fn view_name() -> &'static str;
+
+    /// The query sent on every fetch.
+    fn query() -> TableQuery {
+        TableQuery::new().select("*")
     }
 }

@@ -135,6 +135,8 @@ mod tests {
     }
 
     impl SupabaseRow for TestRow {
+        type Response = crate::request::PrimaryKeyResponse;
+
         fn table_name() -> &'static str {
             "test"
         }

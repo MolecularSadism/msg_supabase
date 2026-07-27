@@ -12,10 +12,11 @@ A flexible [Bevy](https://bevyengine.org/) plugin for syncing game data to [Supa
 - **Deduplication** — skip already-synced records in Insert mode using sync keys
 - **Primary Key Management** — automatically retrieves and stores database IDs for Update mode
 - **Event-driven API** — trigger syncs with `SyncToSupabase<T>`; react to `SyncComplete<T>` or `SyncError<T>`
-- **Request Building** — `WriteOptions` and `TableQuery` express upserts on explicit conflict columns, column projections, filters, ordering and limits
-- **Reads** — `execute_select` pulls rows from tables and views, such as leaderboards
+- **Batches** — trigger `SyncToSupabase::batch(rows)` to write a whole table in one request
+- **Chained Writes** — `SyncComplete<T>` carries the rows Supabase returned, typed as `SupabaseRow::Response`, so a dependent table can read the foreign keys it needs
+- **Reads** — `SupabaseViewPlugin` fetches a table or view on `FetchView<R>` and answers with `ViewFetched<R>`
+- **Request Building** — `WriteOptions` and `TableQuery` express conflict columns, column projections, filters, ordering and limits
 - **Async Bridge** — `ResultQueue` carries results from HTTP callbacks into Bevy systems
-- **Incremental Sync** — `SyncCursor`, `SyncCursors` and `SyncWatermarks` track what the server already has
 - **WASM-compatible** — uses [`ehttp`](https://github.com/emilk/ehttp) for native + browser support
 
 ## Bevy Compatibility
@@ -130,95 +131,76 @@ fn inspect_state(state: Res<SyncState<PlayerStats>>) {
 }
 ```
 
-## Writing Without the Plugin
+## Chained Writes
 
-Workflows that chain requests — insert a session, then its runs keyed by the returned id — drive
-the request layer directly. `WriteOptions` decides how a write resolves conflicts and what it
-returns:
-
-```rust
-use msg_supabase::prelude::*;
-
-// Upsert the runs of a session, and read back the ids the database assigned.
-execute_write_returning(
-    &connection,
-    &run_rows,
-    "runs",
-    &WriteOptions::new()
-        .on_conflict(["session_pk", "run_index"])
-        .returning("id,run_index"),
-    move |result: Result<Vec<RunResponse>, RequestError>| {
-        // ...
-    },
-);
-```
-
-Use `execute_write` when the response body is not needed. Both complete immediately when the row
-slice is empty, so callers do not have to special-case "nothing to push".
-
-`build_write_request` returns the request instead of sending it, for callers that need a different
-timeout or a blocking send — a panic hook uploading a crash report, say.
-
-## Reading
-
-Reads work against tables and views alike:
+A session row's primary key is the foreign key its runs carry, and a run's id is what its kills
+carry. Declare what each row type returns, then chain the writes with observers:
 
 ```rust
-use msg_supabase::prelude::*;
+impl SupabaseRow for RunRow {
+    type Response = RunResponse;            // { id, run_index }
+    fn table_name() -> &'static str { "runs" }
+    fn primary_key_column() -> &'static str { "id" }
+    fn unique_columns() -> &'static [&'static str] { &["session_pk", "run_index"] }
+    fn returning() -> Option<&'static str> { Some("id,run_index") }
+}
 
-execute_select(
-    &connection,
-    "highscores_runs",
-    &TableQuery::new().select("*").order("kills", Order::Descending).limit(10),
-    move |result: Result<Vec<RunHighscore>, RequestError>| {
-        // ...
-    },
-);
-```
+fn on_session_synced(trigger: On<SyncComplete<SessionRow>>, mut commands: Commands) {
+    let Some(session_pk) = trigger.rows.first().map(|row| row.id) else { return };
+    commands.trigger(SyncToSupabase::batch(runs_of(session_pk)));
+}
 
-## Bridging Callbacks Into Bevy
-
-HTTP callbacks run off the main thread with no World access, so they hand results to a
-`ResultQueue` that a system drains:
-
-```rust
-use bevy::prelude::*;
-use msg_supabase::prelude::*;
-
-#[derive(Resource, Default)]
-struct ScoreInbox(ResultQueue<Vec<RunHighscore>>);
-
-fn drain_scores(inbox: Res<ScoreInbox>, mut board: ResMut<Leaderboard>) {
-    for rows in inbox.0.drain() {
-        board.rows = rows;
+fn on_runs_synced(trigger: On<SyncComplete<RunRow>>, mut commands: Commands) {
+    for row in &trigger.rows {
+        // row.id is the foreign key the kills of row.run_index carry
     }
 }
 ```
 
-## Incremental Syncs
+Rows the plugin has already written are dropped before an insert, so the whole list can be
+re-sent on every save. When a row cannot identify itself from its columns — two enemies killed in
+the same frame are identical — hand the batch its keys:
 
-A client that pushes the same growing data set on every autosave needs to know what the server
-already has. `SyncCursor` tracks how much of an append-only list was pushed, `SyncCursors` keeps
-one cursor per key, and `SyncWatermarks` records the last value pushed for counters that only grow:
+```rust
+commands.trigger(SyncToSupabase::batch_with_keys(kill_rows, kill_keys));
+```
+
+## Reading
+
+Register a `SupabaseViewPlugin` per view and trigger `FetchView`:
+
+```rust
+impl SupabaseView for RunHighscore {
+    fn view_name() -> &'static str { "highscores_runs" }
+    fn query() -> TableQuery {
+        TableQuery::new().select("*").order("kills", Order::Descending).limit(10)
+    }
+}
+
+fn refresh(mut commands: Commands) {
+    commands.trigger(FetchView::<RunHighscore>::new());
+}
+
+fn on_scores(mut trigger: On<ViewFetched<RunHighscore>>, mut board: ResMut<Leaderboard>) {
+    board.rows = std::mem::take(&mut trigger.rows);
+}
+```
+
+## Sending Requests Yourself
+
+`build_write_request` returns the request unsent, for callers that need their own timeout or a
+blocking send — a panic hook uploading a crash report, say:
 
 ```rust
 use msg_supabase::prelude::*;
 
-// Only the kills recorded since the last successful push.
-let pending = cursors.pending(&run_index, &kill_records);
-
-// Only the spells whose cast count changed.
-if watermarks.is_ahead(&(run_index, spell.clone()), cast_count) {
-    // ...
-}
-```
-
-## Low-Level HTTP Functions
-
-For custom workflows, the individual request functions are public:
-
-```rust
-use msg_supabase::request::{execute_insert, execute_update, execute_upsert, execute_batch_insert};
+let mut request = build_write_request(
+    &connection,
+    std::slice::from_ref(&report),
+    "crash_reports",
+    &WriteOptions::new(),
+)?;
+request.timeout = Some(Duration::from_secs(5));
 ```
 
 ## License
