@@ -44,9 +44,9 @@ pub struct SyncToSupabase<T: SupabaseRow> {
     /// The rows to sync, written in one request.
     pub rows: Vec<T>,
 
-    /// Deduplication keys, one per row. Empty to fall back on each row's
-    /// [`SupabaseRow::sync_key`].
-    pub sync_keys: Vec<String>,
+    /// Deduplication key for a single-row sync. Rows of a batch key
+    /// themselves through [`SupabaseRow::sync_key`].
+    pub sync_key: Option<String>,
 }
 
 impl<T: SupabaseRow> SyncToSupabase<T> {
@@ -54,7 +54,7 @@ impl<T: SupabaseRow> SyncToSupabase<T> {
     pub fn new(data: T) -> Self {
         Self {
             rows: vec![data],
-            sync_keys: Vec::new(),
+            sync_key: None,
         }
     }
 
@@ -62,7 +62,7 @@ impl<T: SupabaseRow> SyncToSupabase<T> {
     pub fn batch(rows: Vec<T>) -> Self {
         Self {
             rows,
-            sync_keys: Vec::new(),
+            sync_key: None,
         }
     }
 
@@ -70,30 +70,19 @@ impl<T: SupabaseRow> SyncToSupabase<T> {
     pub fn with_key(data: T, key: impl Into<String>) -> Self {
         Self {
             rows: vec![data],
-            sync_keys: vec![key.into()],
+            sync_key: Some(key.into()),
         }
     }
 
-    /// Create a batch whose rows carry their own deduplication keys.
-    ///
-    /// Use this when a row cannot identify itself from its columns alone — two
-    /// enemies killed in the same frame look identical, but their position in
-    /// the list does not. Rows past the end of `keys` fall back on
-    /// [`SupabaseRow::sync_key`].
-    pub fn batch_with_keys(rows: Vec<T>, keys: Vec<String>) -> Self {
-        Self {
-            rows,
-            sync_keys: keys,
-        }
-    }
-
-    /// The sync key of the row at `index`: the key given for it, otherwise the
-    /// row's own.
+    /// The sync key of the row at `index`: the key given for a single-row
+    /// event, otherwise the row's own.
     pub fn effective_sync_key(&self, index: usize) -> Option<String> {
-        self.sync_keys
-            .get(index)
-            .cloned()
-            .or_else(|| self.rows.get(index).and_then(SupabaseRow::sync_key))
+        if self.rows.len() == 1
+            && let Some(ref key) = self.sync_key
+        {
+            return Some(key.clone());
+        }
+        self.rows.get(index).and_then(SupabaseRow::sync_key)
     }
 }
 
@@ -281,7 +270,7 @@ mod tests {
         let data = TestData { value: 42 };
         let event = SyncToSupabase::new(data.clone());
         assert_eq!(event.rows, vec![data]);
-        assert!(event.sync_keys.is_empty());
+        assert!(event.sync_key.is_none());
     }
 
     #[test]
@@ -295,7 +284,7 @@ mod tests {
     fn test_sync_event_with_key() {
         let data = TestData { value: 42 };
         let event = SyncToSupabase::with_key(data.clone(), "custom_key");
-        assert_eq!(event.sync_keys, vec!["custom_key".to_string()]);
+        assert_eq!(event.sync_key, Some("custom_key".to_string()));
     }
 
     #[test]
@@ -310,16 +299,6 @@ mod tests {
         let data = TestData { value: 42 };
         let event = SyncToSupabase::new(data);
         assert_eq!(event.effective_sync_key(0), Some("test_42".to_string()));
-    }
-
-    #[test]
-    fn given_keys_win_over_the_rows_own() {
-        let event = SyncToSupabase::batch_with_keys(
-            vec![TestData { value: 1 }, TestData { value: 1 }],
-            vec!["kill_0".to_string(), "kill_1".to_string()],
-        );
-        assert_eq!(event.effective_sync_key(0), Some("kill_0".to_string()));
-        assert_eq!(event.effective_sync_key(1), Some("kill_1".to_string()));
     }
 
     #[test]
