@@ -11,8 +11,17 @@
 //!   - `Update`: First save inserts, subsequent saves update the same row
 //! - **Session-aware Sync State**: Tracks what has been synced to avoid duplicates
 //! - **Primary Key Management**: Automatically retrieves and stores database IDs
-//! - **Event-driven API**: Trigger syncs with `SyncToSupabase<T>` events;
-//!     listen for `SyncComplete<T>` or `SyncError<T>` to react to outcomes
+//! - **Event-driven API**: Trigger syncs with `SyncToSupabase<T>` events, one row or a batch;
+//!   listen for `SyncComplete<T>` or `SyncError<T>` to react to outcomes
+//! - **Chained Writes**: `SyncComplete<T>` carries the rows Supabase returned, typed as
+//!   [`SupabaseRow::Response`], so a dependent table can read the foreign keys it needs
+//! - **Deduplication**: rows carrying a `sync_key` already written are dropped before an insert,
+//!   so re-sending a growing list writes only what is new
+//! - **Reads**: [`SupabaseViewPlugin`] fetches a table or view on a `FetchView<R>` trigger and
+//!   answers with `ViewFetched<R>`
+//! - **Request Building**: [`WriteOptions`] and [`TableQuery`] cover conflict columns, column
+//!   projections, filters, ordering and limits — and [`build_write_request`] hands back the
+//!   request for callers that send it themselves
 //!
 //! # Example
 //!
@@ -29,6 +38,7 @@
 //! }
 //!
 //! impl SupabaseRow for PlayerStats {
+//!     type Response = PrimaryKeyResponse;
 //!     fn table_name() -> &'static str { "player_stats" }
 //!     fn primary_key_column() -> &'static str { "id" }
 //!     fn unique_columns() -> &'static [&'static str] { &["player_id"] }
@@ -56,28 +66,44 @@ mod config;
 pub mod error;
 mod event;
 mod plugin;
-pub(crate) mod queue;
+pub mod query;
+pub mod queue;
 pub mod request;
 mod state;
 mod traits;
+pub mod view;
 
 pub use config::{SaveMode, SyncConfig};
 pub use error::RequestError;
-pub use event::{SyncComplete, SyncError, SyncToSupabase};
-pub use plugin::SupabasePlugin;
-pub use request::{SupabaseConnection, execute_insert};
+pub use event::{FetchView, SyncComplete, SyncError, SyncToSupabase, ViewFetchFailed, ViewFetched};
+pub use plugin::{SupabaseConfig, SupabasePlugin};
+pub use query::{Order, TableQuery};
+pub use queue::{QueueSender, ResultQueue};
+pub use request::{
+    PrimaryKeyResponse, SupabaseConnection, WriteOptions, WriteResponse, build_select_request,
+    build_write_request, execute_select, execute_write_returning,
+};
 pub use state::SyncState;
-pub use traits::SupabaseRow;
+pub use traits::{SupabaseRow, SupabaseView};
+pub use view::{SupabaseViewConfig, SupabaseViewPlugin};
 
 /// Convenient imports for using `msg_supabase`.
 pub mod prelude {
     pub use crate::config::{SaveMode, SyncConfig};
     pub use crate::error::RequestError;
-    pub use crate::event::{SyncComplete, SyncError, SyncToSupabase};
-    pub use crate::plugin::SupabasePlugin;
-    pub use crate::request::{SupabaseConnection, execute_insert};
+    pub use crate::event::{
+        FetchView, SyncComplete, SyncError, SyncToSupabase, ViewFetchFailed, ViewFetched,
+    };
+    pub use crate::plugin::{SupabaseConfig, SupabasePlugin};
+    pub use crate::query::{Order, TableQuery};
+    pub use crate::queue::{QueueSender, ResultQueue};
+    pub use crate::request::{
+        PrimaryKeyResponse, SupabaseConnection, WriteOptions, WriteResponse, build_select_request,
+        build_write_request, execute_select, execute_write_returning,
+    };
     pub use crate::state::SyncState;
-    pub use crate::traits::SupabaseRow;
+    pub use crate::traits::{SupabaseRow, SupabaseView};
+    pub use crate::view::{SupabaseViewConfig, SupabaseViewPlugin};
 }
 
 #[cfg(test)]
@@ -93,6 +119,8 @@ mod tests {
     }
 
     impl SupabaseRow for TestData {
+        type Response = PrimaryKeyResponse;
+
         fn table_name() -> &'static str {
             "test_data"
         }
@@ -130,7 +158,7 @@ mod tests {
             value: "test".to_string(),
         };
         let event = SyncToSupabase::new(data.clone());
-        assert_eq!(event.data, data);
+        assert_eq!(event.rows, vec![data]);
     }
 
     #[test]
