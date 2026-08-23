@@ -75,7 +75,7 @@ mod traits;
 pub mod view;
 
 pub use config::{SaveMode, SyncConfig};
-pub use delta::SupabaseDeltaSync;
+pub use delta::{BatchId, SupabaseDeltaSync};
 pub use error::RequestError;
 pub use event::{FetchView, SyncComplete, SyncError, SyncToSupabase, ViewFetchFailed, ViewFetched};
 pub use plugin::{SupabaseConfig, SupabasePlugin};
@@ -92,7 +92,7 @@ pub use view::{SupabaseViewConfig, SupabaseViewPlugin};
 /// Convenient imports for using `msg_supabase`.
 pub mod prelude {
     pub use crate::config::{SaveMode, SyncConfig};
-    pub use crate::delta::SupabaseDeltaSync;
+    pub use crate::delta::{BatchId, SupabaseDeltaSync};
     pub use crate::error::RequestError;
     pub use crate::event::{
         FetchView, SyncComplete, SyncError, SyncToSupabase, ViewFetchFailed, ViewFetched,

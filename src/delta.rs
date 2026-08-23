@@ -11,16 +11,26 @@
 //!   its mark; [`commit`](SupabaseDeltaSync::commit) advances the marks only
 //!   once the write lands, so a dropped or failed request is carried again by
 //!   the next push.
-//! - **In-flight guard** — an insert is not idempotent, so while a batch is
-//!   unanswered the table sits out further pushes rather than sending the
-//!   same rows twice. [`commit`](SupabaseDeltaSync::commit) on
+//! - **In-flight guard and batch identity** — an insert is not idempotent, so
+//!   while a batch is unanswered the table sits out further pushes rather
+//!   than sending the same rows twice. [`take_batch`](SupabaseDeltaSync::take_batch)
+//!   hands back a [`BatchId`] alongside the rows; the host captures it next
+//!   to the request it sends and hands it back on the matching outcome —
+//!   [`commit`](SupabaseDeltaSync::commit) on
 //!   [`SyncComplete`](crate::SyncComplete),
 //!   [`abort`](SupabaseDeltaSync::abort) on [`SyncError`](crate::SyncError).
+//!   An outcome whose id does not match the in-flight batch — a stale answer,
+//!   or another system's write of the same row type — is logged and ignored
+//!   instead of advancing marks for rows that never landed.
 //! - **Foreign-key hold-back and substitution** — child rows reference a key
 //!   the server assigned to a parent row. A partition whose parent key has
 //!   not been resolved yet is held back (its mark untouched, its records kept
 //!   for a later push); once the resolver answers, the key is handed to the
 //!   row builder for substitution.
+//!
+//! The send queues are append-only: records may only be added past the
+//! acknowledged marks. When a new session replaces the histories, call
+//! [`reset`](SupabaseDeltaSync::reset) so the marks start over.
 //!
 //! The host keeps the schema: the concrete table cascade order, the resolver
 //! (typically a map filled from a parent table's `SyncComplete` rows), and
@@ -45,7 +55,7 @@
 //! // Run 0's server id is known; run 1's row has not been acked yet.
 //! let run_ids = [(0usize, 77i64)].into_iter().collect::<std::collections::HashMap<_, _>>();
 //!
-//! let batch = sync
+//! let (id, batch) = sync
 //!     .take_batch(
 //!         kills_per_run.iter().map(|(run, kills)| (*run, kills.as_slice())),
 //!         |run| run_ids.get(run).copied(),
@@ -54,7 +64,11 @@
 //!     .expect("run 0 has pending rows");
 //! assert_eq!(batch.len(), 2); // run 1's kill is held back
 //!
-//! sync.commit(); // the write landed: marks advance, the guard clears
+//! // The host keeps `id` next to the request it sends, and its
+//! // SyncComplete/SyncError observers hand back that captured id — an
+//! // outcome from any other write of KillRow carries a different id (or
+//! // none) and is ignored.
+//! sync.commit(id); // the write landed: marks advance, the guard clears
 //! assert_eq!(sync.acked(&0), 2);
 //! assert_eq!(sync.acked(&1), 0);
 //! ```
@@ -64,7 +78,22 @@ use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 
+use bevy::ecs::resource::Resource;
+use bevy::log::warn;
+
 use crate::traits::SupabaseRow;
+
+/// Identity of one batch handed out by
+/// [`take_batch`](SupabaseDeltaSync::take_batch).
+///
+/// Ids increase monotonically per [`SupabaseDeltaSync`] and are never reused,
+/// not even across [`reset`](SupabaseDeltaSync::reset). The host captures the
+/// id when it takes a batch and hands it back to
+/// [`commit`](SupabaseDeltaSync::commit) or
+/// [`abort`](SupabaseDeltaSync::abort) when the matching outcome arrives, so
+/// a stale or unrelated outcome cannot advance the marks or clear the guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BatchId(u64);
 
 /// Delta-sync bookkeeping for one table's append-only send queue: per-partition
 /// high-water marks, an in-flight guard, and foreign-key hold-back.
@@ -77,20 +106,36 @@ use crate::traits::SupabaseRow;
 /// - `K` — the parent key children reference (e.g. the server-assigned run
 ///   id). Use `()` when the table has no parent.
 ///
+/// Like the crate's other per-table state ([`SyncState`](crate::SyncState),
+/// [`ResultQueue`](crate::ResultQueue)), this is a Bevy [`Resource`], so a
+/// host stores one per table directly via `ResMut<SupabaseDeltaSync<R, P, K>>`.
+///
 /// See the [module docs](self) for the full contract and an example.
 pub struct SupabaseDeltaSync<R: SupabaseRow, P = (), K = i64> {
     /// How many records of each partition have been acknowledged.
-    sent: HashMap<P, usize>,
-    /// The marks a write would advance to, held until it answers.
-    in_flight: Option<HashMap<P, usize>>,
+    acked: HashMap<P, usize>,
+    /// The batch awaiting the server's answer: its id and the marks it would
+    /// advance to.
+    in_flight: Option<(BatchId, HashMap<P, usize>)>,
+    /// The id the next batch will be handed; never reused.
+    next_batch_id: u64,
     _marker: PhantomData<fn() -> (R, K)>,
+}
+
+impl<R, P, K> Resource for SupabaseDeltaSync<R, P, K>
+where
+    R: SupabaseRow,
+    P: Send + Sync + 'static,
+    K: 'static,
+{
 }
 
 impl<R: SupabaseRow, P, K> Default for SupabaseDeltaSync<R, P, K> {
     fn default() -> Self {
         Self {
-            sent: HashMap::new(),
+            acked: HashMap::new(),
             in_flight: None,
+            next_batch_id: 0,
             _marker: PhantomData,
         }
     }
@@ -100,7 +145,7 @@ impl<R: SupabaseRow, P: fmt::Debug, K> fmt::Debug for SupabaseDeltaSync<R, P, K>
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SupabaseDeltaSync")
             .field("table", &R::table_name())
-            .field("sent", &self.sent)
+            .field("acked", &self.acked)
             .field("in_flight", &self.in_flight)
             .finish()
     }
@@ -120,13 +165,13 @@ where
     /// How many records of `partition` the server has acknowledged.
     #[must_use]
     pub fn acked(&self, partition: &P) -> usize {
-        self.sent.get(partition).copied().unwrap_or(0)
+        self.acked.get(partition).copied().unwrap_or(0)
     }
 
     /// The acknowledged marks of every partition seen so far.
     #[must_use]
     pub fn marks(&self) -> &HashMap<P, usize> {
-        &self.sent
+        &self.acked
     }
 
     /// Whether a batch is currently awaiting the server's answer.
@@ -137,6 +182,12 @@ where
     #[must_use]
     pub fn is_in_flight(&self) -> bool {
         self.in_flight.is_some()
+    }
+
+    /// The id of the batch currently awaiting the server's answer, if any.
+    #[must_use]
+    pub fn in_flight_id(&self) -> Option<BatchId> {
+        self.in_flight.as_ref().map(|(id, _)| *id)
     }
 
     /// Slice every partition past its mark and build the rows of one batch.
@@ -151,16 +202,24 @@ where
     ///   partition is held back: no rows, mark untouched, records carried by
     ///   a later push.
     ///
+    /// A partition's records list must be append-only: one that shrank below
+    /// its acknowledged mark is held back untouched (with a warning) rather
+    /// than re-sending rows the server already has. Call
+    /// [`reset`](Self::reset) when a new session replaces the histories.
+    ///
     /// Returns `None` when a batch is already in flight, or when nothing is
-    /// pending. Otherwise the proposed marks are parked in flight — call
-    /// [`commit`](Self::commit) when the write lands, or
-    /// [`abort`](Self::abort) when it fails so the rows go out again.
+    /// pending. Otherwise the proposed marks are parked in flight under the
+    /// returned [`BatchId`] — call [`commit`](Self::commit) with that id when
+    /// the write lands, or [`abort`](Self::abort) with it when the write
+    /// fails so the rows go out again.
+    #[must_use = "dropping the batch still parks the proposed marks in flight; \
+                  send the rows and commit() or abort() the returned id"]
     pub fn take_batch<'a, Rec, I>(
         &mut self,
         partitions: I,
         resolve_parent: impl Fn(&P) -> Option<K>,
         mut to_row: impl FnMut(&'a Rec, &K) -> R,
-    ) -> Option<Vec<R>>
+    ) -> Option<(BatchId, Vec<R>)>
     where
         Rec: 'a,
         I: IntoIterator<Item = (P, &'a [Rec])>,
@@ -170,46 +229,111 @@ where
         }
 
         let mut rows = Vec::new();
-        let mut proposed = self.sent.clone();
+        let mut proposed: Option<HashMap<P, usize>> = None;
 
         for (partition, records) in partitions {
             let Some(key) = resolve_parent(&partition) else {
                 continue;
             };
-            let already_sent = self.acked(&partition);
+            // Read through the proposal being built so a partition key
+            // appearing twice in the input emits its rows only once.
+            let already_sent = match &proposed {
+                Some(marks) => marks.get(&partition).copied().unwrap_or(0),
+                None => self.acked(&partition),
+            };
+            if records.len() < already_sent {
+                warn!(
+                    "Delta sync for table '{}': a partition's records list shrank below its \
+                     acknowledged mark ({} < {}); holding it back — call reset() when a new \
+                     session replaces the send queues",
+                    R::table_name(),
+                    records.len(),
+                    already_sent,
+                );
+                continue;
+            }
+            if records.len() == already_sent {
+                continue;
+            }
             rows.extend(records.iter().skip(already_sent).map(|r| to_row(r, &key)));
-            proposed.insert(partition, records.len());
+            proposed
+                .get_or_insert_with(|| self.acked.clone())
+                .insert(partition, records.len());
         }
 
-        if rows.is_empty() {
-            return None;
-        }
-
-        self.in_flight = Some(proposed);
-        Some(rows)
+        let proposed = proposed?;
+        let id = BatchId(self.next_batch_id);
+        self.next_batch_id += 1;
+        self.in_flight = Some((id, proposed));
+        Some((id, rows))
     }
 
     /// The write landed: advance the marks the in-flight batch proposed and
     /// clear the guard.
     ///
-    /// A no-op when nothing is in flight.
-    pub fn commit(&mut self) {
-        if let Some(marks) = self.in_flight.take() {
-            self.sent = marks;
+    /// `id` must be the [`BatchId`] handed out by the
+    /// [`take_batch`](Self::take_batch) call that produced the batch. When it
+    /// does not match the in-flight batch — or nothing is in flight — the
+    /// outcome is stale or belongs to another write of `R`, so it is logged
+    /// and ignored rather than advancing marks for rows that never landed.
+    pub fn commit(&mut self, id: BatchId) {
+        if let Some((_, marks)) = self.in_flight.take_if(|(in_flight, _)| *in_flight == id) {
+            self.acked = marks;
+            return;
+        }
+        match &self.in_flight {
+            Some((in_flight, _)) => warn!(
+                "Delta sync for table '{}': ignoring commit of {id:?} while {in_flight:?} is in \
+                 flight",
+                R::table_name(),
+            ),
+            None => warn!(
+                "Delta sync for table '{}': ignoring commit of {id:?} with nothing in flight",
+                R::table_name(),
+            ),
         }
     }
 
     /// The write failed or was dropped: discard the proposed marks, leaving
     /// the acknowledged marks untouched so the next push carries the same
     /// rows again.
-    pub fn abort(&mut self) {
-        self.in_flight = None;
+    ///
+    /// `id` must be the [`BatchId`] handed out by the
+    /// [`take_batch`](Self::take_batch) call that produced the batch. When it
+    /// does not match the in-flight batch — or nothing is in flight — the
+    /// outcome is stale or belongs to another write of `R`, so it is logged
+    /// and ignored rather than clearing the guard early.
+    pub fn abort(&mut self, id: BatchId) {
+        if self
+            .in_flight
+            .take_if(|(in_flight, _)| *in_flight == id)
+            .is_some()
+        {
+            return;
+        }
+        match &self.in_flight {
+            Some((in_flight, _)) => warn!(
+                "Delta sync for table '{}': ignoring abort of {id:?} while {in_flight:?} is in \
+                 flight",
+                R::table_name(),
+            ),
+            None => warn!(
+                "Delta sync for table '{}': ignoring abort of {id:?} with nothing in flight",
+                R::table_name(),
+            ),
+        }
     }
 
     /// Forget everything — marks and in-flight state — e.g. when a new
-    /// session begins and the send queues start over.
+    /// session begins and the send queues start over. This is the sanctioned
+    /// path for replaced histories: without it, a records list that shrank
+    /// below its acknowledged mark is held back by
+    /// [`take_batch`](Self::take_batch) rather than re-sent.
+    ///
+    /// [`BatchId`]s keep counting up across a reset, so an outcome from
+    /// before the reset can never be mistaken for a later batch's.
     pub fn reset(&mut self) {
-        self.sent.clear();
+        self.acked.clear();
         self.in_flight = None;
     }
 }
@@ -220,11 +344,13 @@ where
 {
     /// [`take_batch`](Self::take_batch) for an unpartitioned table with no
     /// parent key: one list, sliced past its single mark.
+    #[must_use = "dropping the batch still parks the proposed marks in flight; \
+                  send the rows and commit() or abort() the returned id"]
     pub fn take_pending<'a, Rec>(
         &mut self,
         records: &'a [Rec],
         mut to_row: impl FnMut(&'a Rec) -> R,
-    ) -> Option<Vec<R>>
+    ) -> Option<(BatchId, Vec<R>)>
     where
         Rec: 'a,
         K: Default,
@@ -271,7 +397,7 @@ mod tests {
         sync: &mut SupabaseDeltaSync<ChildRow, usize, i64>,
         partitions: &[(usize, Vec<String>)],
         parents: &HashMap<usize, i64>,
-    ) -> Option<Vec<ChildRow>> {
+    ) -> Option<(BatchId, Vec<ChildRow>)> {
         sync.take_batch(
             partitions.iter().map(|(p, r)| (*p, r.as_slice())),
             |p| parents.get(p).copied(),
@@ -288,11 +414,11 @@ mod tests {
         let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
         let lists = vec![(0, records(&["a", "b"]))];
 
-        let batch = take(&mut sync, &lists, &parents).expect("two rows pending");
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("two rows pending");
         assert_eq!(batch.len(), 2);
         assert_eq!(sync.acked(&0), 0, "marks advance on ack, not on send");
 
-        sync.commit();
+        sync.commit(id);
         assert_eq!(sync.acked(&0), 2);
         assert!(!sync.is_in_flight());
     }
@@ -303,12 +429,12 @@ mod tests {
         let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
 
         let lists = vec![(0, records(&["a", "b"]))];
-        take(&mut sync, &lists, &parents).expect("first batch");
-        sync.commit();
+        let (id, _) = take(&mut sync, &lists, &parents).expect("first batch");
+        sync.commit(id);
 
         // The list has grown; only the tail goes out.
         let lists = vec![(0, records(&["a", "b", "c"]))];
-        let batch = take(&mut sync, &lists, &parents).expect("one new row");
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("one new row");
         assert_eq!(
             batch,
             vec![ChildRow {
@@ -317,7 +443,7 @@ mod tests {
             }]
         );
 
-        sync.commit();
+        sync.commit(id);
         assert_eq!(sync.acked(&0), 3);
 
         // Caught up: nothing to send, and no guard is raised.
@@ -331,13 +457,14 @@ mod tests {
         let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
         let lists = vec![(0, records(&["a"]))];
 
-        assert!(take(&mut sync, &lists, &parents).is_some());
+        let (id, _) = take(&mut sync, &lists, &parents).expect("first batch");
         assert!(sync.is_in_flight());
+        assert_eq!(sync.in_flight_id(), Some(id));
 
         // The same rows must not go out twice while unanswered.
         assert!(take(&mut sync, &lists, &parents).is_none());
 
-        sync.commit();
+        sync.commit(id);
         assert!(take(&mut sync, &lists, &parents).is_none(), "caught up");
     }
 
@@ -348,7 +475,7 @@ mod tests {
 
         // Only parent 0 has been acked so far.
         let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
-        let batch = take(&mut sync, &lists, &parents).expect("parent 0's child goes");
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("parent 0's child goes");
         assert_eq!(
             batch,
             vec![ChildRow {
@@ -356,13 +483,13 @@ mod tests {
                 value: "a".to_string()
             }]
         );
-        sync.commit();
+        sync.commit(id);
         assert_eq!(sync.acked(&1), 0, "held-back partition's mark is untouched");
 
         // Parent 1's key arrives: its held-back child goes out, patched with
         // the server-assigned key.
         let parents: HashMap<usize, i64> = [(0, 10), (1, 20)].into_iter().collect();
-        let batch = take(&mut sync, &lists, &parents).expect("parent 1's child goes");
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("parent 1's child goes");
         assert_eq!(
             batch,
             vec![ChildRow {
@@ -370,9 +497,73 @@ mod tests {
                 value: "b".to_string()
             }]
         );
-        sync.commit();
+        sync.commit(id);
         assert_eq!(sync.acked(&0), 1);
         assert_eq!(sync.acked(&1), 1);
+    }
+
+    #[test]
+    fn all_partitions_held_back_raises_no_batch() {
+        let mut sync = SupabaseDeltaSync::<ChildRow, usize, i64>::default();
+        let lists = vec![(0, records(&["a"])), (1, records(&["b"]))];
+
+        // Records are pending but no parent has been resolved yet.
+        let parents: HashMap<usize, i64> = HashMap::new();
+        assert!(take(&mut sync, &lists, &parents).is_none());
+        assert!(!sync.is_in_flight(), "a held-back push raises no guard");
+
+        // Once a parent resolves, its rows go out.
+        let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("parent 0 resolved");
+        assert_eq!(batch.len(), 1);
+        sync.commit(id);
+        assert_eq!(sync.acked(&0), 1);
+    }
+
+    #[test]
+    fn a_duplicated_partition_key_emits_its_rows_once() {
+        let mut sync = SupabaseDeltaSync::<ChildRow, usize, i64>::default();
+        let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
+        let lists = vec![(0, records(&["a", "b"])), (0, records(&["a", "b"]))];
+
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("two rows pending");
+        assert_eq!(batch.len(), 2, "the repeated key contributes nothing new");
+
+        sync.commit(id);
+        assert_eq!(sync.acked(&0), 2);
+        assert!(take(&mut sync, &lists, &parents).is_none(), "caught up");
+    }
+
+    #[test]
+    fn a_shrunk_records_list_is_held_back_untouched() {
+        let mut sync = SupabaseDeltaSync::<ChildRow, usize, i64>::default();
+        let parents: HashMap<usize, i64> = [(0, 10), (1, 20)].into_iter().collect();
+        let lists = vec![(0, records(&["a", "b"])), (1, records(&["c"]))];
+
+        let (id, _) = take(&mut sync, &lists, &parents).expect("three rows");
+        sync.commit(id);
+        assert_eq!(sync.acked(&0), 2);
+
+        // Partition 0's history was replaced with a shorter list without
+        // reset(): it is held back rather than re-sending acked rows, while
+        // partition 1's new row still goes out.
+        let lists = vec![(0, records(&["x"])), (1, records(&["c", "d"]))];
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("partition 1's new row");
+        assert_eq!(
+            batch,
+            vec![ChildRow {
+                parent_id: 20,
+                value: "d".to_string()
+            }]
+        );
+        sync.commit(id);
+        assert_eq!(sync.acked(&0), 2, "shrunk partition's mark is untouched");
+        assert_eq!(sync.acked(&1), 2);
+
+        // The shrunk partition alone raises no batch.
+        let lists = vec![(0, records(&["x"]))];
+        assert!(take(&mut sync, &lists, &parents).is_none());
+        assert!(!sync.is_in_flight());
     }
 
     #[test]
@@ -381,19 +572,59 @@ mod tests {
         let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
         let lists = vec![(0, records(&["a", "b"]))];
 
-        let batch = take(&mut sync, &lists, &parents).expect("first attempt");
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("first attempt");
         assert_eq!(batch.len(), 2);
 
         // The write failed: the guard clears but no mark moves.
-        sync.abort();
+        sync.abort(id);
         assert!(!sync.is_in_flight());
         assert_eq!(sync.acked(&0), 0);
 
         // The next push carries the same rows again.
-        let retry = take(&mut sync, &lists, &parents).expect("retry");
+        let (retry_id, retry) = take(&mut sync, &lists, &parents).expect("retry");
         assert_eq!(retry, batch);
-        sync.commit();
+        sync.commit(retry_id);
         assert_eq!(sync.acked(&0), 2);
+    }
+
+    #[test]
+    fn commit_with_nothing_in_flight_is_a_warned_no_op() {
+        let mut sync = SupabaseDeltaSync::<ChildRow, usize, i64>::default();
+        let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
+        let lists = vec![(0, records(&["a"]))];
+
+        let (id, _) = take(&mut sync, &lists, &parents).expect("batch");
+        sync.commit(id);
+        assert_eq!(sync.acked(&0), 1);
+
+        // A duplicate outcome for the already-answered batch changes nothing.
+        sync.commit(id);
+        sync.abort(id);
+        assert_eq!(sync.acked(&0), 1);
+        assert!(!sync.is_in_flight());
+    }
+
+    #[test]
+    fn an_outcome_with_a_stale_batch_id_is_ignored() {
+        let mut sync = SupabaseDeltaSync::<ChildRow, usize, i64>::default();
+        let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
+        let lists = vec![(0, records(&["a"]))];
+
+        let (stale_id, _) = take(&mut sync, &lists, &parents).expect("first attempt");
+        sync.abort(stale_id);
+        let (retry_id, _) = take(&mut sync, &lists, &parents).expect("retry");
+        assert_ne!(stale_id, retry_id);
+
+        // A late outcome from the aborted attempt must not touch the retry.
+        sync.commit(stale_id);
+        assert!(sync.is_in_flight());
+        assert_eq!(sync.acked(&0), 0);
+        sync.abort(stale_id);
+        assert!(sync.is_in_flight());
+
+        sync.commit(retry_id);
+        assert!(!sync.is_in_flight());
+        assert_eq!(sync.acked(&0), 1);
     }
 
     #[test]
@@ -418,13 +649,13 @@ mod tests {
         let mut sync = SupabaseDeltaSync::<FlatRow, (), ()>::default();
         let list = records(&["a", "b"]);
 
-        let batch = sync
+        let (id, batch) = sync
             .take_pending(&list, |value| FlatRow {
                 value: value.clone(),
             })
             .expect("two rows pending");
         assert_eq!(batch.len(), 2);
-        sync.commit();
+        sync.commit(id);
 
         assert!(
             sync.take_pending(&list, |value| FlatRow {
@@ -441,12 +672,22 @@ mod tests {
         let parents: HashMap<usize, i64> = [(0, 10)].into_iter().collect();
         let lists = vec![(0, records(&["a"]))];
 
-        take(&mut sync, &lists, &parents).expect("batch");
+        let (stale_id, _) = take(&mut sync, &lists, &parents).expect("batch");
         sync.reset();
 
         assert!(!sync.is_in_flight());
         assert_eq!(sync.acked(&0), 0);
-        // Everything goes out again from the start.
-        assert_eq!(take(&mut sync, &lists, &parents).map(|b| b.len()), Some(1));
+        // Everything goes out again from the start, under a fresh id the
+        // pre-reset outcome cannot match.
+        let (id, batch) = take(&mut sync, &lists, &parents).expect("batch after reset");
+        assert_ne!(stale_id, id);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn delta_sync_is_a_bevy_resource() {
+        fn assert_resource<T: Resource>() {}
+        assert_resource::<SupabaseDeltaSync<ChildRow, usize, i64>>();
+        assert_resource::<SupabaseDeltaSync<ChildRow>>();
     }
 }
