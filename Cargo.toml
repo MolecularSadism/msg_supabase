@@ -20,3 +20,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(bevy_lint)"] }
 [lints.clippy]
 too_many_arguments = "allow"
 type_complexity = "allow"
+
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "delta"
+harness = false
