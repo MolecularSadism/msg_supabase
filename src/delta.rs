@@ -111,6 +111,7 @@ pub struct BatchId(u64);
 /// host stores one per table directly via `ResMut<SupabaseDeltaSync<R, P, K>>`.
 ///
 /// See the [module docs](self) for the full contract and an example.
+#[derive(Resource)]
 pub struct SupabaseDeltaSync<R: SupabaseRow, P = (), K = i64> {
     /// How many records of each partition have been acknowledged.
     acked: HashMap<P, usize>,
@@ -120,14 +121,6 @@ pub struct SupabaseDeltaSync<R: SupabaseRow, P = (), K = i64> {
     /// The id the next batch will be handed; never reused.
     next_batch_id: u64,
     _marker: PhantomData<fn() -> (R, K)>,
-}
-
-impl<R, P, K> Resource for SupabaseDeltaSync<R, P, K>
-where
-    R: SupabaseRow,
-    P: Send + Sync + 'static,
-    K: 'static,
-{
 }
 
 impl<R: SupabaseRow, P, K> Default for SupabaseDeltaSync<R, P, K> {

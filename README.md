@@ -23,6 +23,7 @@ A flexible [Bevy](https://bevyengine.org/) plugin for syncing game data to [Supa
 
 | `msg_supabase` | Bevy |
 |----------------|------|
+| 0.5            | 0.19 |
 | 0.4            | 0.18 |
 | 0.3            | 0.18 |
 | 0.1            | 0.18 |
@@ -31,7 +32,7 @@ A flexible [Bevy](https://bevyengine.org/) plugin for syncing game data to [Supa
 
 ```toml
 [dependencies]
-msg_supabase = { git = "https://github.com/MolecularSadism/msg_supabase", tag = "v0.4.0" }
+msg_supabase = { git = "https://github.com/MolecularSadism/msg_supabase", tag = "v0.5.0" }
 ```
 
 ## Quick Start
