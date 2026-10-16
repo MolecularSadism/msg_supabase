@@ -228,12 +228,12 @@ pub fn build_write_request<T: Serialize>(
     let json = serde_json::to_string(rows).map_err(|e| RequestError::serialization(&e))?;
 
     Ok(ehttp::Request {
-        method: "POST".to_string(),
-        url: connection.table_url_with(table, &options.query()),
         body: json.into_bytes(),
-        headers: build_headers(&connection.api_key, &options.prefer_header()),
-        mode: Default::default(),
-        timeout: Some(ehttp::Request::DEFAULT_TIMEOUT),
+        ..ehttp::Request::new(
+            ehttp::Method::POST,
+            connection.table_url_with(table, &options.query()),
+            build_headers(&connection.api_key, &options.prefer_header()),
+        )
     })
 }
 
@@ -265,12 +265,12 @@ pub fn build_select_request(
     query: &TableQuery,
 ) -> ehttp::Request {
     ehttp::Request {
-        method: "GET".to_string(),
-        url: connection.table_url_with(table, query),
         body: Vec::new(),
-        headers: build_read_headers(&connection.api_key),
-        mode: Default::default(),
-        timeout: Some(ehttp::Request::DEFAULT_TIMEOUT),
+        ..ehttp::Request::new(
+            ehttp::Method::GET,
+            connection.table_url_with(table, query),
+            build_read_headers(&connection.api_key),
+        )
     }
 }
 
@@ -381,12 +381,12 @@ pub fn execute_update<T, F>(
     };
 
     let request = ehttp::Request {
-        method: "PATCH".to_string(),
-        url: connection.table_url_with(table, &TableQuery::new().eq(pk_column, primary_key)),
         body: json.into_bytes(),
-        headers: build_headers(&connection.api_key, "return=minimal"),
-        mode: Default::default(),
-        timeout: Some(ehttp::Request::DEFAULT_TIMEOUT),
+        ..ehttp::Request::new(
+            ehttp::Method::PATCH,
+            connection.table_url_with(table, &TableQuery::new().eq(pk_column, primary_key)),
+            build_headers(&connection.api_key, "return=minimal"),
+        )
     };
 
     send(request, move |result| {
@@ -577,7 +577,7 @@ mod tests {
 
         let request = build_write_request(&connection(), &rows, "runs", &options).unwrap();
 
-        assert_eq!(request.method, "POST");
+        assert_eq!(request.method, ehttp::Method::POST);
         assert_eq!(
             request.url,
             "https://test.supabase.co/rest/v1/runs?on_conflict=session_pk,run_index&select=id"
@@ -602,7 +602,7 @@ mod tests {
         let query = TableQuery::new().select("*").limit(1000);
         let request = build_select_request(&connection(), "highscores_runs", &query);
 
-        assert_eq!(request.method, "GET");
+        assert_eq!(request.method, ehttp::Method::GET);
         assert!(request.body.is_empty());
         assert_eq!(
             request.url,
