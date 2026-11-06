@@ -4,6 +4,7 @@ use bevy::log::{info, trace, warn};
 use bevy::prelude::*;
 use std::marker::PhantomData;
 
+use crate::auth::SupabaseAuth;
 use crate::config::{SaveMode, SyncConfig};
 use crate::event::{SyncComplete, SyncError, SyncToSupabase};
 use crate::queue::{SyncOutcome, SyncResultQueue};
@@ -172,6 +173,7 @@ fn on_sync_to_supabase<T: SupabaseRow>(
     supabase_config: Option<Res<SupabaseConfig<T>>>,
     sync_state: Option<Res<SyncState<T>>>,
     queue: Option<Res<SyncResultQueue<T>>>,
+    auth: Option<Res<SupabaseAuth>>,
 ) {
     let Some(supabase_config) = supabase_config else {
         warn!(
@@ -225,6 +227,7 @@ fn on_sync_to_supabase<T: SupabaseRow>(
     let table_name = table.clone();
     let row_count = rows.len();
     let sender = queue.sender();
+    let connection = SupabaseAuth::authenticate(auth.as_deref(), &supabase_config.connection);
 
     // Update mode keeps one row per session: insert once, then patch it.
     let primary_key = sync_state.as_ref().and_then(|state| state.primary_key());
@@ -234,7 +237,7 @@ fn on_sync_to_supabase<T: SupabaseRow>(
         && rows.len() == 1
     {
         execute_update(
-            &supabase_config.connection,
+            &connection,
             row,
             &table,
             primary_key,
@@ -263,7 +266,7 @@ fn on_sync_to_supabase<T: SupabaseRow>(
     }
 
     execute_write_returning(
-        &supabase_config.connection,
+        &connection,
         &rows,
         &table,
         &supabase_config.write_options(),

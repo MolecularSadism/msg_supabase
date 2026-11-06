@@ -24,6 +24,11 @@ pub struct SupabaseConnection {
 
     /// Supabase API key (anon/public key for client-side)
     pub api_key: String,
+
+    /// A signed-in user's access token. Requests carry it as their bearer
+    /// token, so row-level security sees that user; without one they carry
+    /// the API key and run as the anonymous role.
+    pub access_token: Option<String>,
 }
 
 impl SupabaseConnection {
@@ -32,7 +37,26 @@ impl SupabaseConnection {
         Self {
             url: url.into(),
             api_key: api_key.into(),
+            access_token: None,
         }
+    }
+
+    /// Authenticate requests as the user `access_token` belongs to, or as
+    /// the anonymous role for `None`.
+    #[must_use]
+    pub fn with_access_token(mut self, access_token: Option<String>) -> Self {
+        self.access_token = access_token;
+        self
+    }
+
+    /// The token sent in the `Authorization` header.
+    pub fn bearer(&self) -> &str {
+        self.access_token.as_deref().unwrap_or(&self.api_key)
+    }
+
+    /// Build the URL of an Auth API endpoint, e.g. `signup` or `token`.
+    pub fn auth_url(&self, endpoint: &str) -> String {
+        format!("{}/auth/v1/{}", self.url, endpoint)
     }
 
     /// Build the REST API URL for a table.
@@ -168,19 +192,19 @@ impl WriteOptions {
     }
 }
 
-fn build_headers(api_key: &str, prefer: &str) -> ehttp::Headers {
+fn build_headers(connection: &SupabaseConnection, prefer: &str) -> ehttp::Headers {
     ehttp::Headers::new(&[
         ("Content-Type", "application/json"),
-        ("apikey", api_key),
-        ("Authorization", &format!("Bearer {api_key}")),
+        ("apikey", &connection.api_key),
+        ("Authorization", &format!("Bearer {}", connection.bearer())),
         ("Prefer", prefer),
     ])
 }
 
-fn build_read_headers(api_key: &str) -> ehttp::Headers {
+fn build_read_headers(connection: &SupabaseConnection) -> ehttp::Headers {
     ehttp::Headers::new(&[
-        ("apikey", api_key),
-        ("Authorization", &format!("Bearer {api_key}")),
+        ("apikey", &connection.api_key),
+        ("Authorization", &format!("Bearer {}", connection.bearer())),
     ])
 }
 
@@ -232,7 +256,7 @@ pub fn build_write_request<T: Serialize>(
         ..ehttp::Request::new(
             ehttp::Method::POST,
             connection.table_url_with(table, &options.query()),
-            build_headers(&connection.api_key, &options.prefer_header()),
+            build_headers(connection, &options.prefer_header()),
         )
     })
 }
@@ -269,7 +293,7 @@ pub fn build_select_request(
         ..ehttp::Request::new(
             ehttp::Method::GET,
             connection.table_url_with(table, query),
-            build_read_headers(&connection.api_key),
+            build_read_headers(connection),
         )
     }
 }
@@ -385,7 +409,7 @@ pub fn execute_update<T, F>(
         ..ehttp::Request::new(
             ehttp::Method::PATCH,
             connection.table_url_with(table, &TableQuery::new().eq(pk_column, primary_key)),
-            build_headers(&connection.api_key, "return=minimal"),
+            build_headers(connection, "return=minimal"),
         )
     };
 
@@ -396,7 +420,7 @@ pub fn execute_update<T, F>(
 
 /// Send `request`, handing the callback either a successful response or a
 /// [`RequestError`] describing the network or HTTP failure.
-fn send<F>(request: ehttp::Request, on_complete: F)
+pub(crate) fn send<F>(request: ehttp::Request, on_complete: F)
 where
     F: FnOnce(Result<ehttp::Response, RequestError>) + Send + 'static,
 {
@@ -609,5 +633,17 @@ mod tests {
             "https://test.supabase.co/rest/v1/highscores_runs?select=*&limit=1000"
         );
         assert_eq!(header(&request, "apikey").as_deref(), Some("key123"));
+    }
+
+    #[test]
+    fn an_access_token_replaces_the_key_as_bearer_only() {
+        let connection = connection().with_access_token(Some("jwt456".to_string()));
+        let request = build_select_request(&connection, "runs", &TableQuery::new());
+
+        assert_eq!(header(&request, "apikey").as_deref(), Some("key123"));
+        assert_eq!(
+            header(&request, "authorization").as_deref(),
+            Some("Bearer jwt456")
+        );
     }
 }
