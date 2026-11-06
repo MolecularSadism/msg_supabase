@@ -17,6 +17,9 @@
 //!   [`SupabaseRow::Response`], so a dependent table can read the foreign keys it needs
 //! - **Deduplication**: rows carrying a `sync_key` already written are dropped before an insert,
 //!   so re-sending a growing list writes only what is new
+//! - **Anonymous sign-in**: [`SupabaseAuthPlugin`] signs in to Supabase Auth, keeps the session
+//!   fresh, and makes every write and read carry its access token, so row-level security sees
+//!   the user
 //! - **Reads**: [`SupabaseViewPlugin`] fetches a table or view on a `FetchView<R>` trigger and
 //!   answers with `ViewFetched<R>`
 //! - **Request Building**: [`WriteOptions`] and [`TableQuery`] cover conflict columns, column
@@ -62,6 +65,7 @@
 //! }
 //! ```
 
+pub mod auth;
 mod config;
 pub mod delta;
 pub mod error;
@@ -74,6 +78,10 @@ mod state;
 mod traits;
 pub mod view;
 
+pub use auth::{
+    AuthFailed, AuthRequest, AuthSession, AuthSessionStarted, RefreshAuthSession,
+    SignInAnonymously, SupabaseAuth, SupabaseAuthPlugin,
+};
 pub use config::{SaveMode, SyncConfig};
 pub use delta::{BatchId, SupabaseDeltaSync};
 pub use error::RequestError;
@@ -91,6 +99,10 @@ pub use view::{SupabaseViewConfig, SupabaseViewPlugin};
 
 /// Convenient imports for using `msg_supabase`.
 pub mod prelude {
+    pub use crate::auth::{
+        AuthFailed, AuthRequest, AuthSession, AuthSessionStarted, RefreshAuthSession,
+        SignInAnonymously, SupabaseAuth, SupabaseAuthPlugin,
+    };
     pub use crate::config::{SaveMode, SyncConfig};
     pub use crate::delta::{BatchId, SupabaseDeltaSync};
     pub use crate::error::RequestError;

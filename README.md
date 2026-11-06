@@ -14,6 +14,7 @@ A flexible [Bevy](https://bevyengine.org/) plugin for syncing game data to [Supa
 - **Event-driven API** — trigger syncs with `SyncToSupabase<T>`; react to `SyncComplete<T>` or `SyncError<T>`
 - **Batches** — trigger `SyncToSupabase::batch(rows)` to write a whole table in one request
 - **Chained Writes** — `SyncComplete<T>` carries the rows Supabase returned, typed as `SupabaseRow::Response`, so a dependent table can read the foreign keys it needs
+- **Anonymous Sign-in** — `SupabaseAuthPlugin` signs in to Supabase Auth, refreshes the session before it expires, and makes every write and read carry the user's access token for row-level security
 - **Reads** — `SupabaseViewPlugin` fetches a table or view on `FetchView<R>` and answers with `ViewFetched<R>`
 - **Request Building** — `WriteOptions` and `TableQuery` express conflict columns, column projections, filters, ordering and limits
 - **Async Bridge** — `ResultQueue` carries results from HTTP callbacks into Bevy systems
@@ -23,6 +24,7 @@ A flexible [Bevy](https://bevyengine.org/) plugin for syncing game data to [Supa
 
 | `msg_supabase` | Bevy |
 |----------------|------|
+| 0.6            | 0.19 |
 | 0.5            | 0.19 |
 | 0.4            | 0.18 |
 | 0.3            | 0.18 |
@@ -32,7 +34,7 @@ A flexible [Bevy](https://bevyengine.org/) plugin for syncing game data to [Supa
 
 ```toml
 [dependencies]
-msg_supabase = { git = "https://github.com/MolecularSadism/msg_supabase", tag = "v0.5.0" }
+msg_supabase = { git = "https://github.com/MolecularSadism/msg_supabase", tag = "v0.6.0" }
 ```
 
 ## Quick Start
@@ -187,6 +189,38 @@ fn on_scores(mut trigger: On<ViewFetched<RunHighscore>>, mut board: ResMut<Leade
     board.rows = std::mem::take(&mut trigger.rows);
 }
 ```
+
+## Signing In
+
+Add `SupabaseAuthPlugin` and every `SupabasePlugin` write and `SupabaseViewPlugin` read carries
+the signed-in user's access token, so policies can check `auth.uid()`. Without a live session they
+carry the publishable key and run as the `anon` role. Anonymous sign-ins must be enabled in the
+project's Authentication settings.
+
+```rust
+app.add_plugins(SupabaseAuthPlugin::new(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY));
+
+// First launch: a new anonymous user. Later launches: resume it.
+match stored_refresh_token {
+    Some(refresh_token) => commands.trigger(RefreshAuthSession { refresh_token }),
+    None => commands.trigger(SignInAnonymously),
+}
+
+fn on_started(started: On<AuthSessionStarted>, mut store: ResMut<StoredAuth>) {
+    // Supabase rotates refresh tokens: persist the new one right away.
+    store.refresh_token = Some(started.refresh_token.clone());
+}
+
+fn on_failed(failed: On<AuthFailed>, mut commands: Commands) {
+    // A refused refresh means the user is gone; anything else is worth retrying later.
+    if failed.request == AuthRequest::Refresh && failed.refused() {
+        commands.trigger(SignInAnonymously);
+    }
+}
+```
+
+The plugin refreshes the session a minute before its access token expires; each refresh fires
+`AuthSessionStarted` again with the next refresh token.
 
 ## Sending Requests Yourself
 

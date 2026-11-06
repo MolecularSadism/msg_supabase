@@ -4,6 +4,7 @@ use bevy::log::{trace, warn};
 use bevy::prelude::*;
 use std::marker::PhantomData;
 
+use crate::auth::SupabaseAuth;
 use crate::event::{FetchView, ViewFetchFailed, ViewFetched};
 use crate::queue::{ViewOutcome, ViewResultQueue};
 use crate::request::{SupabaseConnection, execute_select};
@@ -108,6 +109,7 @@ fn on_fetch_view<R: SupabaseView>(
     _trigger: On<FetchView<R>>,
     config: Option<Res<SupabaseViewConfig<R>>>,
     queue: Option<Res<ViewResultQueue<R>>>,
+    auth: Option<Res<SupabaseAuth>>,
 ) {
     let Some(config) = config else {
         warn!(
@@ -125,7 +127,7 @@ fn on_fetch_view<R: SupabaseView>(
 
     let sender = queue.sender();
     execute_select(
-        &config.connection,
+        &SupabaseAuth::authenticate(auth.as_deref(), &config.connection),
         R::view_name(),
         &R::query(),
         move |result: Result<Vec<R>, _>| {
