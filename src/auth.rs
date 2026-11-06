@@ -221,6 +221,13 @@ impl SupabaseAuth {
         self.pending.is_some()
     }
 
+    /// Make requests as `session`, one obtained outside this plugin (a test,
+    /// or a sign-in flow of the caller's own).
+    pub fn insert_session(&mut self, session: AuthSession) {
+        self.session = Some(session);
+        self.retry_at = None;
+    }
+
     /// Forget the session. Requests are made as the anonymous role again.
     pub fn sign_out(&mut self) {
         self.session = None;
@@ -566,6 +573,18 @@ mod tests {
         assert!(failed(422).refused());
         assert!(!failed(429).refused());
         assert!(!failed(500).refused());
+    }
+
+    #[test]
+    fn an_inserted_session_authenticates_requests() {
+        let mut auth = SupabaseAuth::new(connection());
+        auth.insert_session(AuthSession {
+            user_id: "u".into(),
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+        });
+        assert_eq!(auth.access_token(), Some("a"));
     }
 
     #[test]
